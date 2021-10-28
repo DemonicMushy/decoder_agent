@@ -13,6 +13,9 @@ dotenv.config();
 ////////////////////////////////////////////////////////////////////////////////
 // global variables
 ////////////////////////////////////////////////////////////////////////////////
+
+const sharedVolumeDir = process.env.SHARED_VOLUME_MOUNT;
+
 const remoteIPv4Url = "http://ipv4bot.whatismyipaddress.com/"; // to get external ip
 const taskControllerEndpoint = process.env.TASKCONTROLLER_URL;
 const decoderStartWaitTime = process.env.DECODER_START_WAIT_TIME || 30000;  // milliseconds
@@ -20,7 +23,11 @@ const intervalPeriod = process.env.POLLING_PERIOD || 15000; // milliseconds
 const port = process.env.PORT;
 const root = os.platform() === "win32" ? "c:" : "/";
 const num_bytes_for_buffer = 100000; // 100kb, buffer space for transcription
-const transcriptionDestination = "./transcriptions" // output folder for transcriptions, meant to be docker volume mapped to existing location
+const inputDir = path.join(sharedVolumeDir, 'input')
+const outputDir = path.join(sharedVolumeDir, 'output')
+// const logsDir = sharedVolumeDir + '/logs'
+const detailsDir = path.join(sharedVolumeDir, 'details')
+const transcriptionDestination = path.join(sharedVolumeDir, "transcriptions") // output folder for transcriptions, meant to be docker volume mapped to existing location
 
 var worker_name = `ipv4address-${os.hostname}`; // ipv4address will be assigned below
 const worker_queue = process.env.WORKER_QUEUE; // default value is 'normal'
@@ -222,7 +229,7 @@ function handleTask(task) {
 
   if (supported_extensions.includes(ext)) {
     saveMetadataFile(meta_info);
-    saveFileFromURL(cloud_url, original_filename).then(() => {
+    saveFileFromPath(cloud_url, original_filename).then(() => {
       decoderStartTimeout = setTimeout(() => {
         cleanUpDecoderFiles();
         outgoingRequestsQueue.push((cb) =>
@@ -237,15 +244,19 @@ function handleTask(task) {
   }
 }
 
-function saveFileFromURL(url, dest) {
-  return axios({
-    method: "get",
-    url: url,
-    responseType: "stream",
-  })
+function saveFileFromPath(filePath, dest) {
+  // return axios({
+  //   method: "get",
+  //   url: url,
+  //   responseType: "stream",
+  // })
+  var readStream = fs.createReadStream(path.join(sharedVolumeDir, 'gateway_uploads', path.parse(filePath).base));
+  var contentLength = fs.statSync(filePath).size;
+  var promiseResolved = false
+  Promise.resolve({ data: readStream, contentLength: contentLength })
     .then((response) => {
       return new Promise(async (resolve, reject) => {
-        var content_length = Number(response.headers["content-length"]);
+        var content_length = Number(response.contentLength);
 
         let avail = await getAvailableSpace();
 
@@ -257,7 +268,7 @@ function saveFileFromURL(url, dest) {
           cleanUpDecoderFiles();
           reject();
         } else {
-          var file = fs.createWriteStream(`./input/${dest}`);
+          var file = fs.createWriteStream(inputDir + `/${dest}`);
           response.data.pipe(file);
 
           let error = null;
@@ -279,14 +290,22 @@ function saveFileFromURL(url, dest) {
             }
           });
         }
+        promiseResolved = true
       });
     })
     .catch((err) => {
+      promiseResolved = false
       console.log(`DOWNLOAD_ERROR: ${err}`);
       outgoingRequestsQueue.push((cb) =>
         sendFailureStatus("DOWNLOAD_ERROR", cb)
       );
     });
+
+    if(promiseResolved) {
+      return Promise.resolve()
+    } else {
+      return Promise.reject()
+    }
 }
 
 function saveMetadataFile(val) {
@@ -311,7 +330,7 @@ function saveMetadataFile(val) {
         : undefined,
     };
 
-    fs.writeFile(`./input/${name}.txt`, JSON.stringify(data), (error) => {
+    fs.writeFile(`${inputDir}/${name}.txt`, JSON.stringify(data), (error) => {
       if (error) {
         console.log(`FILE: Error creating metadata file. ${error}`);
       } else {
@@ -327,7 +346,7 @@ function sendTranscriptionFiles(callback) {
   return new Promise((resolve, reject) => {
     var name = path.parse(converted_filename).name;
     var original_name = path.parse(original_filename).name;
-    fs.readdir(`./output/${name}`, (err, files) => {
+    fs.readdir(`${outputDir}/${name}`, (err, files) => {
       if (files === undefined) {
         outgoingRequestsQueue.push((cb) =>
           sendFailureStatus("TRANSCRIPTIONS_NOT_FOUND", cb)
@@ -337,7 +356,8 @@ function sendTranscriptionFiles(callback) {
 
       var zip = new AdmZip();
       files.forEach((itemname) => {
-        zip.addLocalFile(`./output/${name}/${itemname}`);
+        zip.addLocalFile(`${outputDir}/${name}/${itemname}`);
+        console.log(`${outputDir}/${name}/${itemname} added`)
       });
 
       var zipBuffer = zip.toBuffer();
@@ -362,7 +382,7 @@ function saveFile(key, data) {
 
 function cleanUpDecoderFiles() {
   // remove audio file
-  fs.unlink(`./input/${converted_filename}`, (error) => {
+  fs.unlink(`${inputDir}/${converted_filename}`, (error) => {
     if (error)
       console.log(`CLEANUP: Error during removal of input file: ${error}`);
     else console.log(`CLEANUP: Input file ${converted_filename} removed.`);
@@ -371,21 +391,21 @@ function cleanUpDecoderFiles() {
   var name = path.parse(converted_filename).name;
 
   // remove metadata file
-  fs.unlink(`./input/${name}.txt`, (error) => {
+  fs.unlink(`${inputDir}/${name}.txt`, (error) => {
     if (error)
       console.log(`CLEANUP: Error during removal of metadata file: ${error}`);
     else console.log(`CLEANUP: Metadata file ${name} removed.`);
   });
 
   // remove details files
-  fs.rmdir(`./details/${name}`, { recursive: true }, (error) => {
+  fs.rmdir(`${detailsDir}/${name}`, { recursive: true }, (error) => {
     if (error)
       console.log(`CLEANUP: Error during removal of details files: ${error}`);
     else console.log(`CLEANUP: Details files for ${name} removed.`);
   });
 
   // remove transcription files
-  fs.rmdir(`./output/${name}`, { recursive: true }, (error) => {
+  fs.rmdir(`${outputDir}/${name}`, { recursive: true }, (error) => {
     if (error)
       console.log(`CLEANUP: Error during removal of output files: ${error}`);
     else console.log(`CLEANUP: Output files for ${name} removed.`);
@@ -395,12 +415,12 @@ function cleanUpDecoderFiles() {
 function emptyInputFolder() {
   // clean input folder, to be called once upon initialize
   console.log("Attempting to empty input folder of contents...");
-  fs.readdir(`./input`, (err, files) => {
+  fs.readdir(`${inputDir}`, (err, files) => {
     if (files === undefined) {
       console.log("Input folder already empty. Doing nothing...");
     } else {
       files.forEach((itemname) => {
-        fs.unlinkSync(`./input/${itemname}`);
+        fs.unlinkSync(`${inputDir}/${itemname}`);
         console.log(`Input folder item ${itemname} removed.`);
       });
     }
